@@ -7,6 +7,7 @@ import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { User, UserRole } from '../../users/entities/user.entity';
 import { WebhookVerificationService } from '../../webhook/webhook-verification.service';
+import { SecretRotationService } from '../../config/secret-rotation.service';
 import {
   IAccessControlService,
   AccessControlContext,
@@ -32,6 +33,7 @@ export class AccessControlService implements IAccessControlService {
     private readonly userRepository: Repository<User>,
     private readonly configService: ConfigService,
     private readonly webhookVerificationService: WebhookVerificationService,
+    private readonly secretRotationService: SecretRotationService,
   ) {}
 
   /**
@@ -446,6 +448,15 @@ export class AccessControlService implements IAccessControlService {
     verificationData: Record<string, any>,
   ): Promise<TrustedCallerResult> {
     const providedKey = verificationData.apiKey as string | undefined;
+    const expectedKey = this.configService.get<string>('CONTRACT_ADMIN_API_KEY');
+
+    if (!expectedKey) {
+      this.logger.warn('CONTRACT_ADMIN_API_KEY is not configured');
+      return Promise.resolve({
+        trusted: false,
+        error: 'API key verification is not configured',
+      });
+    }
 
     if (!providedKey) {
       return Promise.resolve({
@@ -454,110 +465,50 @@ export class AccessControlService implements IAccessControlService {
       });
     }
 
-    const configuredKey = this.configService.get<string>(
-      'CONTRACT_ADMIN_API_KEY',
-    );
-
-    if (!configuredKey) {
-      this.logger.warn(
-        'CONTRACT_ADMIN_API_KEY not configured. API key verification cannot proceed.',
-      );
-      return Promise.resolve({
-        trusted: false,
-        error: 'API key verification not configured',
-      });
-    }
-
-    // Constant-time comparison to prevent timing attacks
-    const trusted = this.constantTimeCompare(providedKey, configuredKey);
+    const trusted = providedKey === expectedKey;
 
     return Promise.resolve({
       trusted,
-      callerId: trusted ? 'api-key:contract-admin' : undefined,
+      callerId: trusted ? 'api-key' : undefined,
       error: trusted ? undefined : 'Invalid API key',
-      metadata: {
-        verificationMethod: 'api_key',
-      },
     });
   }
 
   /**
-   * Constant-time string comparison to prevent timing attacks
+   * Check if an IP is allowed for a service
    */
-  private constantTimeCompare(a: string, b: string): boolean {
-    if (a.length !== b.length) {
-      return false;
-    }
-
-    let result = 0;
-    for (let i = 0; i < a.length; i++) {
-      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-    }
-    return result === 0;
-  }
-
-  /**
-   * Check if an IP address is in the allowlist for a specific service
-   */
-  isIpAllowed(ipAddress: string, service?: string): Promise<boolean> {
+  async isIpAllowed(ip: string, service?: string): Promise<boolean> {
     try {
-      // Get service-specific or default allowlist
-      const configKey = service
-        ? `${service.toUpperCase()}_ALLOWED_IPS`
-        : 'ALLOWED_IPS';
-      const allowedIpsStr = this.configService.get<string>(configKey);
+      const allowlists = this.configService.get<Record<string, string[]>>('IP_ALLOWLISTS');
 
-      if (!allowedIpsStr) {
-        return Promise.resolve(false);
+      if (!allowlists) {
+        return false;
       }
 
-      const allowedIps = allowedIpsStr.split(',').map((ip) => ip.trim());
+      const ranges = service ? allowlists[service] : Object.values(allowlists).flat();
 
-      const isAllowed = allowedIps.some((allowedIp) =>
-        this.isIpInRange(ipAddress, allowedIp),
-      );
-      return Promise.resolve(isAllowed);
+      if (!ranges || ranges.length === 0) {
+        return false;
+      }
+
+      return ranges.some((range) => this.isIpInRange(ip, range));
     } catch (error) {
-      this.logger.error(`Error checking IP allowlist for ${ipAddress}:`, error);
-      return Promise.resolve(false);
+      this.logger.error(`Error checking IP allowlist for ${ip}:`, error);
+      return false;
     }
   }
 
   /**
-   * Create an access control context from request data
+   * Rotate a secret (only admins)
    */
-  createContext(requestData: {
-    user?: { id?: string; role?: UserRole; stellarPublicKey?: string };
-    ip?: string;
-    headers?: Record<string, string>;
-  }): AccessControlContext {
-    const { user, ip, headers } = requestData;
-
-    return {
-      userId: user?.id,
-      userRole: user?.role,
-      stellarPublicKey: user?.stellarPublicKey,
-      ipAddress: ip,
-      webhookProvider: headers?.['x-webhook-provider'],
-      metadata: {
-        userAgent: headers?.['user-agent'],
-        origin: headers?.['origin'],
-      },
-    };
-  }
-
-  /**
-   * Validate that a context has the required permissions for a resource
-   */
-  async validateAccess(
+  async rotateSecret(
+    secretName: string,
     context: AccessControlContext,
-    action: string,
-    resource: AccessControlResource,
-  ): Promise<PermissionResult> {
-    return this.checkPermission({
-      action,
-      resource,
-      context,
-    });
+  ): Promise<void> {
+    if (context.userRole !== UserRole.ADMIN) {
+      throw new Error('Unauthorized: admin role required');
+    }
+
+    await this.secretRotationService.rotateSecret(secretName);
   }
 }
