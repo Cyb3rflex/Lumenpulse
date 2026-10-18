@@ -92,3 +92,135 @@ Rules, by tier:
 ### Testing requirement
 
 Any contract with `instance` or `persistent` storage must have at least one test that advances the ledger **past `LEDGER_THRESHOLD` more than once**, performing a read or write between each advance, and asserts the contract still functions correctly after every advance. A single advance isn't enough to prove anything — the entry could simply have started with a generous default TTL. Advancing twice only passes if a bump actually happened in between. See `upgradable-contract`'s `test_ttl_extended_after_read_write` / `test_instance_storage_accessible_after_ledger_advance`, or `pricing_adapter`'s `test_ttl_extended_across_read_and_write`, as the reference shape for this test.
+
+## Event Versioning Standard (issue #1057)
+
+Contracts emit events with `#[contractevent]` so the backend and other
+off-chain consumers can react to on-chain state changes without polling.
+Those consumers decode events by shape — by field order, type, and topic
+list — so a change to an event's shape that isn't otherwise signaled is
+indistinguishable, on the wire, from a consumer bug: the old decoder either
+misreads the new fields or panics. `version-interface` already solves this
+problem at the *contract* level (`contract_version()`); this section is the
+matching rule for individual **event schemas**, backed by the
+`event-versioning` crate.
+
+### The pattern
+
+Every `#[contractevent]` struct that is part of a contract's public event
+surface must:
+
+1. Declare a `#[topic] pub version: u32` field as its **first** field (i.e.
+   the first topic after the event-name topic `#[contractevent]` derives
+   automatically from the struct name).
+2. Implement `event_versioning::VersionedEvent` for that version number,
+   via the `versioned_event!` macro rather than a hand-written `impl`.
+3. Set `version: <Type>::EVENT_VERSION` in the function that constructs and
+   publishes the event — never a literal, so the topic and the declared
+   constant cannot drift apart.
+
+```rust
+use event_versioning::{versioned_event, VersionedEvent};
+use soroban_sdk::{contractevent, Address, Env};
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WidgetCreatedEvent {
+    #[topic]
+    pub version: u32,
+    #[topic]
+    pub owner: Address,
+    pub amount: i128,
+}
+versioned_event!(WidgetCreatedEvent, 1);
+
+pub fn publish_widget_created(env: &Env, owner: Address, amount: i128) {
+    WidgetCreatedEvent {
+        version: WidgetCreatedEvent::EVENT_VERSION,
+        owner,
+        amount,
+    }
+    .publish(env);
+}
+```
+
+`treasury` and `lumenpulse-curation` (both under `contracts/*/src/events.rs`)
+are the canonical, fully-adopted references for this pattern — copy their
+shape for new events rather than re-deriving it.
+
+### Why the version is a topic, not just a data field
+
+Soroban event topics are what consumers filter and subscribe on without
+first decoding the data payload. Putting `version` in the topic list (as
+opposed to only in the data struct) means:
+
+- A consumer can detect a schema it doesn't understand yet — and skip or
+  quarantine it — from the topic list alone, before attempting to decode
+  data that may no longer match its expected shape.
+- A consumer can subscribe to a specific `(event_name, version)` pair using
+  the same topic-filtering RPC calls it already uses to filter by event
+  name, rather than needing a new mechanism.
+
+### When to bump `EVENT_VERSION`
+
+Bump the version when a change is not transparently decodable by an
+existing consumer: a field is added, removed, reordered, renamed, or its
+type or unit changes (e.g. a timestamp moving from seconds to
+milliseconds). Don't bump it for changes that don't affect the emitted
+schema, such as renaming a local variable or a doc comment.
+
+When a schema does change, prefer keeping the old struct (renamed with a
+`V1` suffix, still implementing `VersionedEvent` at its original version)
+in place and adding a new struct at the bumped version, rather than
+mutating the existing struct — this keeps historical events decodable by
+consumers that haven't upgraded yet, matching how `treasury::events`
+already keeps deprecated shapes (e.g. `StreamData` vs `StreamV2`) alongside
+current ones instead of migrating in place.
+
+### Adopting the pattern in a new or existing contract
+
+- New contract, new events module: write every event to the pattern from
+  the start; add `event-versioning = { path = "../event-versioning" }` to
+  `Cargo.toml`.
+- Existing contract, adding a new event to an existing module: write the
+  new event to the pattern even if sibling events in the same file
+  predate it; there's no requirement to retrofit the whole file in the
+  same change, but do add the crate dependency and follow the pattern for
+  anything new.
+- Retrofitting an existing event's *topics* changes what's on-chain for
+  future emissions of that event (the event name topic is unaffected,
+  but the topic list gains one more entry) — flag this in the PR
+  description so backend indexers know to expect the extra topic once
+  the change deploys, the same way any other topic-shape change would be
+  called out.
+
+## Golden payload fixtures (issue #1623)
+
+Versioning alone tells a consumer *that* an event changed; it doesn't stop a
+schema change from passing `cargo test` unnoticed. Every event that adopts
+the standard above is therefore pinned by a committed golden fixture under
+`contracts/event-golden/fixtures/<contract>/<event>.v<N>.json`, compared on
+every `cargo test` run. See
+[`contracts/event-golden/README.md`](contracts/event-golden/README.md) for the
+fixture format and the full regeneration workflow.
+
+The short version, when you intentionally change an event:
+
+1. If the change is schema-breaking, bump `EVENT_VERSION` and keep the old
+   shape under a `V<N>`-suffixed struct (as above).
+2. Regenerate the fixture for the new version:
+
+   ```sh
+   UPDATE_GOLDEN=1 cargo test -p treasury
+   UPDATE_GOLDEN=1 cargo test -p lumenpulse-community-curation
+   ```
+
+   Regeneration refuses to overwrite an existing fixture at the same version,
+   so a payload change without a version bump fails loudly.
+3. Commit the fixture diff with the code change and run `cargo test`. The
+   backend mapper's `event-golden-fixtures.spec.ts` consumes the same files,
+   so a renamed event that the mapper no longer recognises also fails CI.
+
+New event-versioned events must be added to the relevant
+`contracts/<contract>/src/golden.rs` case list and a fixture generated in the
+same change.

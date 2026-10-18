@@ -465,7 +465,36 @@ export class AccessControlService implements IAccessControlService {
       });
     }
 
-    const trusted = providedKey === expectedKey;
+    const configuredKey = this.configService.get<string>(
+      'CONTRACT_ADMIN_API_KEY',
+    );
+
+    // Once a rotation has happened the rotation store owns the value; fall
+    // back to the boot-time value when nothing has been rotated yet.
+    const rotatedKeys = this.secretRotationService.acceptableValues(
+      'CONTRACT_ADMIN_API_KEY',
+    );
+    const candidates = rotatedKeys.length
+      ? rotatedKeys
+      : configuredKey
+        ? [configuredKey]
+        : [];
+
+    if (candidates.length === 0) {
+      this.logger.warn(
+        'CONTRACT_ADMIN_API_KEY not configured. API key verification cannot proceed.',
+      );
+      return Promise.resolve({
+        trusted: false,
+        error: 'API key verification not configured',
+      });
+    }
+
+    // Constant-time comparison to prevent timing attacks. During a rotation
+    // overlap window the previous value is still accepted.
+    const trusted = candidates.some((candidate) =>
+      this.constantTimeCompare(providedKey, candidate),
+    );
 
     return Promise.resolve({
       trusted,
